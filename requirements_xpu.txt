@@ -1,0 +1,10 @@
+diffusers
+datasets
+soundfile
+pyannote.audio
+kenlm
+pyctcdecode
+librosa
+sentencepiece
+fire
+peft

@@ -1,0 +1,93 @@
+{
+  "builder_name": "minds14",
+  "citation": "@article{gerz2021multilingual,\n  title={Multilingual and cross-lingual intent detection from spoken data},\n  author={Gerz, Daniela and Su, Pei-Hao and Kusztos, Razvan and Mondal, Avishek and Lis, Michal and Singhal, Eshan and Mrk{\u000b{s}}i{'c}, Nikola and Wen, Tsung-Hsien and Vuli{'c}, Ivan},\n  journal={arXiv preprint arXiv:2104.08524},\n  year={2021}\n}\n",
+  "config_name": "en-US",
+  "dataset_name": "minds14",
+  "dataset_size": 293497,
+  "description": "MINDS-14 is a dataset for the intent detection task with spoken data. It covers 14 intents extracted from a commercial system in the e-banking domain, associated with spoken examples in 14 diverse language varieties.",
+  "download_checksums": {
+    "https://www.dropbox.com/s/e2us0hcs3ilr20e/MInDS-14.zip?dl=1": {
+      "num_bytes": 471355396,
+      "checksum": null
+    }
+  },
+  "download_size": 471355396,
+  "features": {
+    "path": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "audio": {
+      "sampling_rate": 8000,
+      "_type": "Audio"
+    },
+    "transcription": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "english_transcription": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "intent_class": {
+      "names": [
+        "abroad",
+        "address",
+        "app_error",
+        "atm_limit",
+        "balance",
+        "business_loan",
+        "card_issues",
+        "cash_deposit",
+        "direct_debit",
+        "freeze",
+        "high_value_payment",
+        "joint_account",
+        "latest_transactions",
+        "pay_bill"
+      ],
+      "_type": "ClassLabel"
+    },
+    "lang_id": {
+      "names": [
+        "cs-CZ",
+        "de-DE",
+        "en-AU",
+        "en-GB",
+        "en-US",
+        "es-ES",
+        "fr-FR",
+        "it-IT",
+        "ko-KR",
+        "nl-NL",
+        "pl-PL",
+        "pt-PT",
+        "ru-RU",
+        "zh-CN"
+      ],
+      "_type": "ClassLabel"
+    }
+  },
+  "homepage": "https://arxiv.org/abs/2104.08524",
+  "license": "",
+  "size_in_bytes": 471648893,
+  "splits": {
+    "train": {
+      "name": "train",
+      "num_bytes": 293497,
+      "num_examples": 563,
+      "dataset_name": "minds14"
+    }
+  },
+  "supervised_keys": {
+    "input": "audio",
+    "output": "transcription"
+  },
+  "version": {
+    "version_str": "1.0.0",
+    "description": "",
+    "major": 1,
+    "minor": 0,
+    "patch": 0
+  }
+}

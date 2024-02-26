@@ -1,0 +1,15 @@
+transformers
+torch
+intel_extension_for_pytorch
+Pillow
+diffusers
+torchvision
+datasets
+soundfile
+pyannote.audio
+kenlm
+pyctcdecode
+librosa
+sentencepiece
+fire
+peft
