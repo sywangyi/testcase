@@ -6,29 +6,40 @@ https://github.com/tloen/alpaca-lora/blob/main/finetune.py
 import os
 import sys
 import time
-import random
-import numpy as np
 from typing import List
 
 import fire
 import torch
 import transformers
+from accelerate import Accelerator
 from datasets import load_dataset
 
 from peft import (
     LoraConfig,
     get_peft_model,
-    get_peft_model_state_dict,
     set_peft_model_state_dict,
+    prepare_model_for_kbit_training,
 )
-from transformers import LlamaForCausalLM, LlamaTokenizer
+
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback, TrainingArguments, TrainerState, TrainerControl 
 from transformers import set_seed
+from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 
 from utils import Prompter
+import logging
+
+logging.basicConfig(level=logging.INFO)
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+sys.path.append(os.path.dirname(__file__) + "/..")
+
+from common import get_awq_config, get_bitsandbytes_config, synchronize_device
+
 
 SEED = 42
 set_seed(SEED)
-
+    
 def train(
     # model/data params
     base_model: str = "meta-llama/Llama-2-7b-hf",  # the only required argument
@@ -57,9 +68,13 @@ def train(
     wandb_log_model: str = "",  # options: false | true
     resume_from_checkpoint: str = None,  # either training checkpoint or final adapter
     prompt_template_name: str = "alpaca",  # The prompt template to use, will default to alpaca.
+    bitsandbytes: str = None,
+    autoawq: str = None,
+    device: str = None,
     **kwargs,
 ):
-    if int(os.environ.get("LOCAL_RANK", 0)) == 0:
+    local_rank = int(os.environ.get("LOCAL_RANK", 0)) or int(os.environ.get("PMI_RANK", 0))
+    if local_rank == 0:
         print(
             f"Training Alpaca-LoRA model with params:\n"
             f"base_model: {base_model}\n"
@@ -98,11 +113,8 @@ def train(
     prompter = Prompter(template_path)
 
     # device_map = "auto"
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-    ddp = world_size != 1
-    if ddp:
-        # device_map = {"": int(os.environ.get("LOCAL_RANK") or 0)}
-        gradient_accumulation_steps = gradient_accumulation_steps // world_size
+    world_size = int(os.environ.get("WORLD_SIZE", 0)) or int(os.environ.get("PMI_SIZE", 0))
+    ddp = world_size > 1
 
     # Check if parameter passed or if set within environ
     use_wandb = len(wandb_project) > 0 or (
@@ -116,15 +128,33 @@ def train(
     if len(wandb_log_model) > 0:
         os.environ["WANDB_LOG_MODEL"] = wandb_log_model
 
-    model = LlamaForCausalLM.from_pretrained(
+    quantization_config = None
+    if bitsandbytes:
+        logging.info(f"Use {bitsandbytes} biteansbytes quantization")
+        quantization_config = get_bitsandbytes_config(bitsandbytes)
+    elif autoawq:
+        logging.info(f"Use {autoawq} AutoAWQ quantization, please pass a quantized model like 'TheBloke/firefly-llama2-7B-chat-AWQ'")
+        quantization_config = get_awq_config(autoawq)
+
+    if device == "cpu":
+        device_map = None
+    else:
+        device_map={'': Accelerator().process_index}
+    model = AutoModelForCausalLM.from_pretrained(
         base_model,
         low_cpu_mem_usage=True,
+        torch_dtype=torch.bfloat16,
+        quantization_config=quantization_config,
+        device_map=device_map,
     )
 
-    tokenizer = LlamaTokenizer.from_pretrained(base_model)
+    if bitsandbytes is not None:
+        model = prepare_model_for_kbit_training(model)
+
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
 
     tokenizer.pad_token_id = 0  # unk. we want this to be different from the eos token
-    tokenizer.padding_side = "left"  # Allow batched inference
+    tokenizer.padding_side = "right"
 
     def tokenize(prompt, add_eos_token=True):
         # there's probably a way to do this with the tokenizer settings
@@ -217,6 +247,25 @@ def train(
         train_data = data["train"].shuffle().map(generate_and_tokenize_prompt)
         val_data = None
 
+    class SavePeftModelCallback(TrainerCallback):
+        def on_save(
+            self,
+            args: TrainingArguments,
+            state: TrainerState,
+            control: TrainerControl,
+            **kwargs,
+        ):
+            checkpoint_folder = os.path.join(args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}")
+
+            peft_model_path = os.path.join(checkpoint_folder, "adapter_model")
+            kwargs["model"].save_pretrained(peft_model_path)
+
+            pytorch_model_path = os.path.join(checkpoint_folder, "pytorch_model.bin")
+            if os.path.exists(pytorch_model_path):
+                os.remove(pytorch_model_path)
+            return control
+    
+    
     trainer = transformers.Trainer(
         model=model,
         train_dataset=train_data,
@@ -227,7 +276,7 @@ def train(
             warmup_steps=100,
             num_train_epochs=num_epochs,
             learning_rate=learning_rate,
-            logging_steps=10,
+            logging_steps=1,
             optim="adamw_torch",
             evaluation_strategy="steps" if val_set_size > 0 else "no",
             save_strategy="steps",
@@ -241,19 +290,22 @@ def train(
             report_to="none",
             **kwargs,
         ),
+        callbacks=[SavePeftModelCallback],
         data_collator=transformers.DataCollatorForSeq2Seq(
             tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
         ),
     )
     model.config.use_cache = False
 
-    old_state_dict = model.state_dict
-    model.state_dict = (
-        lambda self, *_, **__: get_peft_model_state_dict(self, old_state_dict())
-    ).__get__(model, type(model))
-
+    # old_state_dict = model.state_dict
+    # model.state_dict = (
+    #     lambda self, *_, **__: get_peft_model_state_dict(self, old_state_dict())
+    # ).__get__(model, type(model))
+    
+    synchronize_device(trainer.args.device.type)
     start = time.time()
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+    synchronize_device(trainer.args.device.type)
     end = time.time()
     print(f"total training and evaluation time: {end-start}s")
 

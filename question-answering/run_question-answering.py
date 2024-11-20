@@ -11,7 +11,7 @@ sys.setrecursionlimit(10000000)
 import os
 
 sys.path.append(os.path.dirname(__file__) + "/..")
-from common import get_args, get_torch_dtype, wrap_forward_for_benchmark
+from common import get_args, get_torch_dtype, wrap_forward_for_benchmark, synchronize_device
 
 logging.basicConfig(level=logging.INFO)
 inference_context = [torch.inference_mode()]
@@ -33,8 +33,10 @@ def benchmark(pipe, question, context, warm_up_steps, run_steps):
     with ContextManagers(inference_context):
         for i in range(warm_up_steps + run_steps):
             pipe.forward_time = 0
+            synchronize_device(pipe.device.type)
             pre = time.time()
             output = pipe(question=question, context=context)
+            synchronize_device(pipe.device.type)
             time_costs.append((time.time() - pre) * 1000)
             forward_times.append(pipe.forward_time * 1000)
 
@@ -75,12 +77,15 @@ if __name__ == "__main__":
     )
     wrap_forward_for_benchmark(pipe)
 
+    if args.optimum_intel:
+        logging.info("Use optimum-intel")
+        from optimum.intel import IPEXModelForQuestionAnswering
+        pipe.model = IPEXModelForQuestionAnswering(pipe.model, export=True, torch_dtype=torch_dtype)
     if args.torch_compile:
         logging.info(f"Use torch compile with {args.backend} backend")
         if args.backend == "ipex":
             import intel_extension_for_pytorch as ipex
-        pipe.model = torch.compile(pipe.model, backend=args.backend)
-        pipe.model.generate = torch.compile(pipe.model.generate, backend=args.backend)
+        pipe.model.forward = torch.compile(pipe.model.forward, backend=args.backend)
     if args.ipex_optimize:
         logging.info("Use ipex optimize")
         import intel_extension_for_pytorch as ipex

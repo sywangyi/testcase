@@ -1,11 +1,19 @@
 import argparse
 import torch
 import time
+import random
+from transformers import AwqConfig, BitsAndBytesConfig
 
+random.seed(42)
 
 def str2bool(str):
     return True if str.lower() == "true" else False
 
+def synchronize_device(device):
+    if device == "xpu":
+        torch.xpu.synchronize()
+    elif device == "cuda":
+        torch.cuda.synchronize()
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -29,6 +37,11 @@ def get_args():
     parser.add_argument("--ipex_optimize_transformers", default="False", type=str2bool)
     parser.add_argument("--warm_up_steps", default=10, type=int)
     parser.add_argument("--run_steps", default=10, type=int)
+    parser.add_argument("--optimum_intel", default="False", type=str2bool)
+    parser.add_argument("--bitsandbytes", default=None, type=str,
+        help="Apply bitsandbytes quantization and input the quant type choose from [int8, nf4, fp4]")
+    parser.add_argument("--autoawq", default=None, type=str,
+        help="Apply AutoAWQ quantization and input the quant type choose from [int4]")
     args = parser.parse_args()
     return args
 
@@ -40,6 +53,29 @@ def get_torch_dtype(dtype):
         return torch.float16
     else:
         return torch.float32
+
+
+def get_bitsandbytes_config(quant_type):
+    if quant_type == "int8":
+        quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+    elif quant_type in ("nf4", "fp4"):
+        quantization_config = BitsAndBytesConfig(load_in_4bit=True,
+                                                 bnb_4bit_compute_dtype=torch.bfloat16,
+                                                 bnb_4bit_quant_type=quant_type,
+                                                 bnb_4bit_use_double_quant=False)
+    else:
+        quantization_config = None
+
+    return quantization_config
+
+
+def get_awq_config(quant_type):
+    if quant_type == "int4":
+        quantization_config = AwqConfig(version="ipex")
+    else:
+        quantization_config = None
+
+    return quantization_config
 
 
 def wrapped_forward(self, model_inputs, **forward_params):
@@ -56,4 +92,12 @@ def wrap_forward_for_benchmark(pipeline):
     pipeline.__class__._forward = wrapped_forward
 
 
-args = get_args()
+def get_batched_prompts(prompt, batch_size):
+    prompt_list = [prompt]
+    token_list = prompt.split(" ")
+    assert len(token_list) > 18
+    for _ in range(batch_size - 1):
+        prompt_len = random.randint(16, len(token_list) - 2)
+        new_prompt = " ".join(token_list[:prompt_len])
+        prompt_list.append(new_prompt)
+    return prompt_list

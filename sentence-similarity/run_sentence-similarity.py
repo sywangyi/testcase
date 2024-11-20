@@ -10,7 +10,7 @@ import os
 
 sys.path.append(os.path.dirname(__file__) + "/..")
 
-from common import get_args, get_torch_dtype, wrap_forward_for_benchmark
+from common import get_args, get_torch_dtype, wrap_forward_for_benchmark, synchronize_device
 
 logging.basicConfig(level=logging.INFO)
 SEED = 20
@@ -41,6 +41,7 @@ def benchmark(extractor, sentences, seed, nb_pass):
     for _ in range(nb_pass):
         torch.manual_seed(seed)
         extractor.forward_time = 0
+        synchronize_device(extractor.device.type)
         start = time.time()
         encoded_input = extractor.tokenizer(
             sentences, padding=True, truncation=True, return_tensors="pt"
@@ -53,6 +54,7 @@ def benchmark(extractor, sentences, seed, nb_pass):
             mean_pooling(model_output[1], encoded_input["attention_mask"][1])
         )
         score = torch.inner(sentence_embeddings_1, sentence_embeddings_2)
+        synchronize_device(extractor.device.type)
         duration = time.time() - start
         elapsed_times.append(duration * 1000)
         forward_times.append(extractor.forward_time * 1000)
@@ -111,7 +113,7 @@ def apply_torch_compile(extractor, backend):
     logging.info(f"using torch compile with {backend} backend for acceleration...")
     if backend == "ipex":
         import intel_extension_for_pytorch as ipex
-    extractor.model = torch.compile(extractor.model, backend=backend)
+    extractor.model.forward = torch.compile(extractor.model.forward, backend=backend)
     return extractor
 
 
@@ -129,7 +131,8 @@ if __name__ == "__main__":
     device = args.device
     if device == "xpu":
         import intel_extension_for_pytorch as ipex
-
+        torch.use_deterministic_algorithms(True)
+        
     torch_dtype = get_torch_dtype(args.model_dtype)
     dtype = get_torch_dtype(args.autocast_dtype)
     enable = dtype != torch.float32

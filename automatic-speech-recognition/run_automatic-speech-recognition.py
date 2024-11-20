@@ -10,13 +10,13 @@ logging.basicConfig(level=logging.INFO)
 
 import sys
 import os
+import torch._inductor.config
 
 sys.path.append(os.path.dirname(__file__) + "/..")
 
-from common import get_args, get_torch_dtype, wrap_forward_for_benchmark
+from common import get_args, get_torch_dtype, wrap_forward_for_benchmark, synchronize_device
 
 inference_context = [torch.inference_mode()]
-
 
 def generate(generator, pipe_input, warm_up_steps, run_steps):
     time_costs = []
@@ -24,11 +24,12 @@ def generate(generator, pipe_input, warm_up_steps, run_steps):
     with ContextManagers(inference_context):
         for i in range(warm_up_steps + run_steps):
             generator.forward_time = 0
+            synchronize_device(generator.device.type)
             pre = time.time()
             output = generator(pipe_input)
+            synchronize_device(generator.device.type)
             time_costs.append((time.time() - pre) * 1000)
             forward_times.append(generator.forward_time * 1000)
-
     average_time = sum(time_costs[warm_up_steps:]) / run_steps
     average_fwd_time = sum(forward_times[warm_up_steps:]) / run_steps
     logging.info(f"total time [ms]: {time_costs}")
@@ -47,12 +48,14 @@ if __name__ == "__main__":
     device = args.device
     if device == "xpu":
         import intel_extension_for_pytorch as ipex
-
+        torch.use_deterministic_algorithms(True)
+        
     data = load_from_disk("./datasets/speech_demo")
     torch_dtype = get_torch_dtype(args.model_dtype)
     dtype = get_torch_dtype(args.autocast_dtype)
     enable = dtype != torch.float32
 
+    torch._inductor.config.cpp_wrapper = True
     if enable:
         inference_context.append(torch.autocast(device, dtype, enable))
 
@@ -73,10 +76,7 @@ if __name__ == "__main__":
             if args.backend == "ipex":
                 import intel_extension_for_pytorch as ipex
             logging.info(f"using torch compile with {args.backend} backend")
-            generator.model.generate = torch.compile(
-                generator.model.generate, backend=args.backend
-            )
-            generator.model = torch.compile(generator.model, backend=args.backend)
+            generator.model.forward = torch.compile(generator.model.forward, backend=args.backend)
         elif args.ipex_optimize:
             import intel_extension_for_pytorch as ipex
 
@@ -96,7 +96,7 @@ if __name__ == "__main__":
             logging.info(f"using torch compile with {args.backend} backend")
             if args.backend == "ipex":
                 import intel_extension_for_pytorch as ipex
-            generator = torch.compile(generator, backend=args.backend)
+            generator.model.forward = torch.compile(generator.model.forward, backend=args.backend)
         elif args.ipex_optimize:
             logging.info("Pyannote do not support ipex optimize")
 

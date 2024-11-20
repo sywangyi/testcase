@@ -12,7 +12,7 @@ import os
 import sys
 
 sys.path.append(os.path.dirname(__file__) + "/..")
-from common import get_args, get_torch_dtype, wrap_forward_for_benchmark
+from common import get_args, get_torch_dtype, wrap_forward_for_benchmark, synchronize_device
 
 inference_context = [torch.inference_mode()]
 
@@ -45,8 +45,10 @@ def benchmark(pipeline, image, labels, seed, nb_pass):
     for _ in range(nb_pass):
         torch.manual_seed(seed)
         pipeline.forward_time = 0
+        synchronize_device(pipeline.device.type)
         start = time.time()
         outputs = pipeline(image, candidate_labels=labels)
+        synchronize_device(pipeline.device.type)
         duration = time.time() - start
         elapsed_times.append(duration * 1000)
         forward_times.append(pipeline.forward_time * 1000)
@@ -115,7 +117,7 @@ def apply_torch_compile(classifier, backend):
     logging.info(f"using torch compile with {backend} backend for acceleration...")
     if backend == "ipex":
         import intel_extension_for_pytorch as ipex
-    classifier.model = torch.compile(classifier.model, backend=backend)
+    classifier.model.forward = torch.compile(classifier.model.forward, backend=backend)
     return classifier
 
 

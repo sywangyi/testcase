@@ -19,7 +19,7 @@ import sys
 sys.setrecursionlimit(100000)
 sys.path.append(os.path.dirname(__file__) + "/..")
 
-from common import get_args, get_torch_dtype
+from common import get_args, get_torch_dtype, synchronize_device
 
 SEED = 20
 IMG_URL = "https://raw.githubusercontent.com/timothybrooks/instruct-pix2pix/main/imgs/example.jpg"
@@ -89,6 +89,7 @@ def download_image(url):
 def benchmark(pipe, prompt, image, seed, nb_pass, model_id):
     elapsed_time = []
     for i in range(nb_pass):
+        synchronize_device(pipe.device.type)
         start = time.time()
         torch.manual_seed(seed)
         if model_id == "lambdalabs/sd-image-variations-diffusers":
@@ -99,6 +100,7 @@ def benchmark(pipe, prompt, image, seed, nb_pass, model_id):
             ).images[0]
         else:
             new_image = pipe(prompt=prompt, image=image).images[0]
+        synchronize_device(pipe.device.type)
         duration = time.time() - start
         elapsed_time.append(duration * 1000)
         new_image.save(f"img_{i}.jpg", "JPEG")
@@ -188,7 +190,7 @@ def apply_torch_compile(pipe, backend):
     logging.info(f"using torch compile with {backend} backend for acceleration...")
     if backend == "ipex":
         import intel_extension_for_pytorch as ipex
-    pipe.unet = torch.compile(pipe.unet, backend=backend)
+    pipe.unet.forward = torch.compile(pipe.unet.forward, backend=backend)
     return pipe
 
 
