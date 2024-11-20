@@ -15,7 +15,7 @@ sys.setrecursionlimit(100000)
 
 sys.path.append(os.path.dirname(__file__) + "/..")
 
-from common import get_args, get_torch_dtype
+from common import get_args, get_torch_dtype, synchronize_device
 
 SEED = 20
 PROMPT = "An astronaut riding a green horse"
@@ -67,9 +67,11 @@ def load_model(model_id, seed, model_dtype, device):
 def benchmark(pipe, prompt, seed, nb_pass):
     elapsed_time = []
     for i in range(nb_pass):
+        synchronize_device(pipe.device.type)
         start = time.time()
         torch.manual_seed(seed)
         image = pipe(prompt=prompt).images[0]
+        synchronize_device(pipe.device.type)
         duration = time.time() - start
         elapsed_time.append(duration * 1000)
         image.save(f"img_{i}.jpg", "JPEG")
@@ -166,7 +168,7 @@ def apply_torch_compile(pipe, backend):
     logging.info(f"using torch compile with {backend} backend for acceleration...")
     if backend == "ipex":
         import intel_extension_for_pytorch as ipex
-    pipe.unet = torch.compile(pipe.unet, backend=backend)
+    pipe.unet.forward = torch.compile(pipe.unet.forward, backend=backend)
 
     return pipe
 

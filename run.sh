@@ -16,9 +16,12 @@ input_tokens=32
 output_tokens=32
 ipex_optimize_transformers="False"
 gradient_checkpointing="False"
-num_processes=6
+num_processes=4
 warm_up_steps=10
 run_steps=10
+optimum_intel="False"
+bitsandbytes="None"
+autoawq="None"
 
 # Function to display script usage
 usage() {
@@ -31,7 +34,7 @@ usage() {
  echo " -j, --jit             Use jit "
  echo " -c, --torch_compile   Use torch compile"
  echo " --model_dtype         Indicate the model dtype[float32, bfloat16, float16]"
- echo " --autocast_dtype       Indicate the compute dtype[float32, bfloat16, float16]"
+ echo " --autocast_dtype      Indicate the compute dtype[float32, bfloat16, float16]"
  echo " --backend             Indicate the torch compile backend[ipex, inductor]"
  echo " --device              Indicate the computation device[cpu, cuda, xpu]"
  echo " --batch_size          Input batch size for text-generation"
@@ -41,8 +44,11 @@ usage() {
  echo " --ipex_optimize_transformers              Ipex optimize_transformers for text-generation"
  echo " --gradient_checkpointing         Whether to run fine-tuning with gradient checkpoint to save memory, only used for fine-tune task"
  echo " --num_processes       The number of data parallelism, only used for CPU fine-tune task"
- echo " --warm_up_steps      The benchmark warm up steps for all tasks"
- echo " --run_steps          The benchmark run steps for all tasks"
+ echo " --warm_up_steps       The benchmark warm up steps for all tasks"
+ echo " --run_steps           The benchmark run steps for all tasks"
+ echo " --optimum_intel       Use optimum-intel optimization"
+ echo " --bitsandbytes        Use bitsandbytes quantization and indicate the bitsandbytes quantization type[int8, nf4, fp4]"
+ echo " --autoawq             Use AutoAWQ quantization and indicate the AutoAWQ quantization type[int4]"
 }
 
 has_argument() {
@@ -147,6 +153,18 @@ handle_options() {
         run_steps=$(extract_argument $@)
         shift
         ;;
+      --optimum_intel)
+        optimum_intel=$(extract_argument $@)
+        shift
+        ;;
+      --bitsandbytes)
+        bitsandbytes=$(extract_argument $@)
+        shift
+        ;;
+      --autoawq)
+        autoawq=$(extract_argument $@)
+        shift
+        ;;
       *)
         echo "Invalid option: $1" >&2
         usage
@@ -163,32 +181,25 @@ handle_options "$@"
 
 if [[ "$device" = "cpu" ]]; then
   # Setup environment variables for performance on Xeon
-  export LD_PRELOAD=${CONDA_PREFIX}/lib/libstdc++.so.6
-  export KMP_BLOCKTIME=INF
-  export KMP_TPAUSE=0
-  export KMP_SETTINGS=1
-  export KMP_AFFINITY=granularity=fine,compact,1,0
-  export KMP_FORJOIN_BARRIER_PATTERN=dist,dist
-  export KMP_PLAIN_BARRIER_PATTERN=dist,dist
-  export KMP_REDUCTION_BARRIER_PATTERN=dist,dist
-  export LD_PRELOAD=${LD_PRELOAD}:${CONDA_PREFIX}/lib/libiomp5.so # Intel OpenMP
+  export LD_PRELOAD=${LD_PRELOAD}:/opt/conda/envs/idp/lib/libiomp5.so # Intel OpenMP
   # Tcmalloc is a recommended malloc implementation that emphasizes fragmentation avoidance and scalable concurrency support.
-  export LD_PRELOAD=${LD_PRELOAD}:${CONDA_PREFIX}/lib/libtcmalloc.so
+  export LD_PRELOAD=${LD_PRELOAD}:/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4
 fi
+CORES=`lscpu | grep 'Core(s) per socket' | awk '{print $4}'`
 export TORCHINDUCTOR_FREEZING=1
 export TRITON_CODEGEN_INTEL_XPU_BACKEND=1
-export OMP_NUM_THREADS=56
+export OMP_NUM_THREADS=${CORES}
+export TORCHINDUCTOR_CPP_MIN_CHUNK_SIZE=${CORES}
 
 # Perform the desired actions based on the provided flags and arguments
 if [[ "$task_name" == "fine-tune" ]]; then
   if [[ "$device" == "cpu" ]]; then
     export CCL_WORKER_COUNT=1
-    oneccl_bindings_for_pytorch_path=$(python -c "from oneccl_bindings_for_pytorch import cwd; print(cwd)")
-    source $oneccl_bindings_for_pytorch_path/env/setvars.sh
-    mpirun -n $num_processes -ppn 1 -genv OMP_NUM_THREADS=$(($OMP_NUM_THREADS*2/$num_processes)) -genv MASTER_ADDR=127.0.0.1 -genv MASTER_PORT=29500 python $task_name/run_$task_name.py --bf16 True --use_ipex $ipex_optimize
+    source /opt/intel/oneapi/setvars.sh
+    accelerate launch --config_file $task_name/"$device"_config.yaml $task_name/run_$task_name.py --base_model $model_id --use_ipex $ipex_optimize --bitsandbytes $bitsandbytes --autoawq $autoawq --device $device
   else
-    accelerate launch --config_file $task_name/"$device"_config.yaml $task_name/run_$task_name.py
+    accelerate launch --config_file $task_name/"$device"_config_ddp.yaml $task_name/run_$task_name.py --base_model $model_id --bitsandbytes $bitsandbytes --autoawq $autoawq --device $device
   fi
 else
-  numactl -C 0-55 --membind 0 python $task_name/run_$task_name.py --model_id $model_id --model_dtype $model_dtype --jit $jit --ipex_optimize $ipex_optimize --autocast_dtype $autocast_dtype --torch_compile $torch_compile --backend $backend --device $device --batch_size $batch_size --num_beams $num_beams --input_tokens $input_tokens --output_tokens $output_tokens --ipex_optimize_transformers $ipex_optimize_transformers --warm_up_steps $warm_up_steps --run_steps $run_steps
+  numactl -C '0-'${CORES} --membind 0 python $task_name/run_$task_name.py --model_id $model_id --model_dtype $model_dtype --bitsandbytes $bitsandbytes --autoawq $autoawq --jit $jit --ipex_optimize $ipex_optimize --autocast_dtype $autocast_dtype --torch_compile $torch_compile --backend $backend --device $device --batch_size $batch_size --num_beams $num_beams --input_tokens $input_tokens --output_tokens $output_tokens --ipex_optimize_transformers $ipex_optimize_transformers --warm_up_steps $warm_up_steps --run_steps $run_steps --optimum_intel $optimum_intel
 fi

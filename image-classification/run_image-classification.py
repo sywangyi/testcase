@@ -12,7 +12,7 @@ import os
 import sys
 
 sys.path.append(os.path.dirname(__file__) + "/..")
-from common import get_args, get_torch_dtype, wrap_forward_for_benchmark
+from common import get_args, get_torch_dtype, wrap_forward_for_benchmark, synchronize_device
 
 SEED = 24
 IMG_URL = "http://images.cocodataset.org/val2017/000000039769.jpg"
@@ -41,8 +41,10 @@ def benchmark(pipeline, image, seed, nb_pass):
     for _ in range(nb_pass):
         torch.manual_seed(seed)
         pipeline.forward_time = 0
+        synchronize_device(pipeline.device.type)
         start = time.time()
         outputs = pipeline(image)
+        synchronize_device(pipeline.device.type)
         duration = time.time() - start
         elapsed_times.append(duration * 1000)
         forward_times.append(pipeline.forward_time * 1000)
@@ -97,7 +99,7 @@ def apply_torch_compile(classifier, backend):
     logging.info(f"using torch compile with {backend} backend for acceleration...")
     if backend == "ipex":
         import intel_extension_for_pytorch as ipex
-    classifier.model = torch.compile(classifier.model, backend=backend)
+    classifier.model.forward = torch.compile(classifier.model.forward, backend=backend)
     return classifier
 
 
@@ -111,6 +113,7 @@ if __name__ == "__main__":
     use_jit = args.jit
     use_torch_compile = args.torch_compile
     backend = args.backend
+    use_optimum_intel = args.optimum_intel
 
     device = args.device
     if device == "xpu":
@@ -127,6 +130,10 @@ if __name__ == "__main__":
     classifier = load_model(model_id, SEED, torch_dtype, device)
     wrap_forward_for_benchmark(classifier)
 
+    if use_optimum_intel:
+        logging.info("Use optimum-intel")
+        from optimum.intel import IPEXModelForImageClassification
+        classifier.model = IPEXModelForImageClassification(classifier.model, export=True, torch_dtype=torch_dtype)
     if use_ipex_optimize:
         classifier = optimize_with_ipex(
             classifier, dtype=torch_dtype, device=device

@@ -12,7 +12,7 @@ import sys
 
 sys.path.append(os.path.dirname(__file__) + "/..")
 
-from common import get_args, get_torch_dtype, wrap_forward_for_benchmark
+from common import get_args, get_torch_dtype, wrap_forward_for_benchmark, synchronize_device
 
 inference_context = [torch.inference_mode()]
 
@@ -23,10 +23,12 @@ def generate(generator, forward_params, warm_up_steps, run_steps):
     with ContextManagers(inference_context):
         for i in range(run_steps + warm_up_steps):
             generator.forward_time = 0
+            synchronize_device(generator.device.type)
             pre = time.time()
             output = generator(
                 "Hello, my dog is cooler than you!", forward_params=forward_params
             )
+            synchronize_device(generator.device.type)
             time_costs.append((time.time() - pre) * 1000)
             forward_times.append(generator.forward_time * 1000)
 
@@ -62,7 +64,7 @@ if __name__ == "__main__":
 
     embeddings_dataset = load_from_disk("./datasets/speech_vector")
     speaker_embedding = (
-        torch.tensor(embeddings_dataset[0]["xvector"]).unsqueeze(0).to(device)
+        torch.tensor(embeddings_dataset[0]["xvector"]).unsqueeze(0).to(device).to(torch_dtype)
     )
     # by default the dtype of speaker_embedding is FP32, if the model dtype is not FP32, we need to manually convert it
     if torch_dtype != torch.float32:
@@ -81,10 +83,12 @@ if __name__ == "__main__":
         logging.info(f"Use torch compile with {args.backend} backend")
         if args.backend == "ipex":
             import intel_extension_for_pytorch as ipex
-        synthesiser.model.generate = torch.compile(
-            synthesiser.model.generate, backend=args.backend
-        )
-        synthesiser.model = torch.compile(synthesiser.model, backend=args.backend)
+        if "Bark" in synthesiser.model.__class__.__name__:
+            synthesiser.model.semantic.forward = torch.compile(synthesiser.model.semantic.forward)
+            synthesiser.model.coarse_acoustics.forward = torch.compile(synthesiser.model.coarse_acoustics.forward)
+            synthesiser.model.fine_acoustics.forward = torch.compile(synthesiser.model.fine_acoustics.forward)
+        else:
+            synthesiser.model.generate = torch.compile(synthesiser.model.generate)
     elif args.ipex_optimize:
         logging.info("Use ipex optimize")
         import intel_extension_for_pytorch as ipex

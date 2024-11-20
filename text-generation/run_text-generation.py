@@ -12,10 +12,29 @@ import os
 
 sys.path.append(os.path.dirname(__file__) + "/..")
 
-from common import get_args, get_torch_dtype, wrap_forward_for_benchmark
+from common import (
+    get_args,
+    get_torch_dtype,
+    get_awq_config,
+    get_bitsandbytes_config,
+    wrap_forward_for_benchmark,
+    synchronize_device,
+    get_batched_prompts,
+)
 
-inference_context = [torch.inference_mode()]
+inference_context = [torch.no_grad()]
 
+MODEL_LIST = [
+    "gpt-j",
+    "llama",
+    "gpt-neox",
+    "opt",
+    "falcon",
+    "bloom",
+    "baichuan",
+    "t5",
+    "gpt2",
+]
 
 def generate(generator, input_sentence, batch_size, warm_up_steps, run_steps):
     latency = []
@@ -23,10 +42,12 @@ def generate(generator, input_sentence, batch_size, warm_up_steps, run_steps):
     with ContextManagers(inference_context):
         for i in range(warm_up_steps + run_steps):
             generator.forward_time = 0
+            synchronize_device(generator.device.type)
             pre = time.time()
             output = generator(
-                input_sentence, batch_size=batch_size, **generation_kwargs
+                input_sentence, batch_size=batch_size, generation_config=generation_config
             )
+            synchronize_device(generator.device.type)
             latency.append((time.time() - pre) * 1000)
             forward_latency.append(generator.forward_time * 1000)
 
@@ -43,31 +64,27 @@ def benchmark(
     input_len = len(tokenizer(input_sentence[0])["input_ids"])
     logging.info(f"input tokens length is {input_len}")
 
-    generation_kwargs["max_new_tokens"] = 1
+    _, _, _ = generate(generator, input_sentence, batch_size, 1, 1)
+    generation_config.max_new_tokens = 1
+    generation_config.min_new_tokens = 1
 
     first_latency, out, _ = generate(
         generator, input_sentence, batch_size, warm_up_steps, run_steps
     )
 
-    out_num = (
-        len(tokenizer(out[0][0]["generated_text"])["input_ids"]) - input_len
-    ) * batch_size
-    logging.info(
-        f"1st token latency = {first_latency/out_num} ms"
-    )
-    logging.info(f"output token nums = {out_num}")
+    logging.info(f"1st token latency = {first_latency} ms")
+    logging.info(f"output token nums = {batch_size}")
 
-    generation_kwargs["max_new_tokens"] = output_tokens
+    generation_config.max_new_tokens = output_tokens
+    generation_config.min_new_tokens = output_tokens
     latency, out, forward_latency = generate(
         generator, input_sentence, batch_size, warm_up_steps, run_steps
     )
-    out_num = (
-        len(tokenizer(out[0][0]["generated_text"])["input_ids"]) - input_len
-    ) * batch_size
+    out_num = output_tokens
     logging.info(
-        f"2nd+ token latency = {(latency - first_latency) / (out_num - batch_size)} ms"
+        f"2nd+ token latency = {(latency - first_latency) / (out_num - 1)} ms"
     )
-    logging.info(f"output token nums = {out_num}")
+    logging.info(f"output token nums = {out_num*batch_size}")
     logging.info(f"output = {out}")
     logging.info(
         f"pipeline average time [ms] {latency}, average fwd time [ms] {forward_latency}"
@@ -89,75 +106,80 @@ if __name__ == "__main__":
     with open("./datasets/prompt.json", "r") as f:
         prompt = json.load(f)
 
-    generation_kwargs = dict(do_sample=False, num_beams=args.num_beams, use_cache=True)
     torch_dtype = get_torch_dtype(args.model_dtype)
     dtype = get_torch_dtype(args.autocast_dtype)
     enable = dtype != torch.float32
     if enable:
         inference_context.append(torch.autocast(device, dtype, enable))
+    
+    device_map = {"": 0} if device != "cpu" else "cpu"
+    model_kwargs = dict(torch_dtype=torch_dtype, device_map=device_map)
+    quantization_config = None
+    if args.bitsandbytes in ("int8", "nf4", "fp4"):
+        logging.info(f"Use {args.bitsandbytes} bitsandbytes quantization")
+        quantization_config = get_bitsandbytes_config(args.bitsandbytes)
+    elif args.autoawq in ("int4"):
+        logging.info(f"Use {args.autoawq} AutoAWQ quantization, please use it in a AWQ int4 model like TheBloke/Mistral-7B-v0.1-AWQ")
+        quantization_config = get_awq_config(args.autoawq)
+
+    if quantization_config is not None:
+        model_kwargs["quantization_config"] = quantization_config
 
     tokenizer = AutoTokenizer.from_pretrained(model_id)
+    tokenizer.padding_side = 'left'
+    tokenizer.pad_token_id = tokenizer.eos_token_id
     generator = pipeline(
         "text-generation",
         model=model_id,
-        torch_dtype=torch_dtype,
-        device=device,
         tokenizer=tokenizer,
-        **generation_kwargs,
+        model_kwargs=model_kwargs,
     )
-    if "llama" in model_id:
-        generator.tokenizer.pad_token_id = generator.model.config.eos_token_id
+    generation_config = generator.model.generation_config
+    generation_config.do_sample = False
+    generation_config.use_cache = True
+    generation_config.temperature = 1.0
+    generation_config.num_beams = args.num_beams
+    generation_config.max_new_tokens = args.output_tokens
+    generation_config.min_new_tokens = args.output_tokens
+    generation_config.top_p = 1.0
+    generation_config.cache_implementation="static"
+
+    if "falcon" in model_id:
+        # For the correct shape of static cache
+        if not getattr(generator.model.config, "new_decoder_architecture", False):
+            generator.model.config.num_key_value_heads = 1
     wrap_forward_for_benchmark(generator)
 
-    input_seq = prompt["gpt-j"][str(args.input_tokens)]
-    input_seq = [input_seq] * args.batch_size
+    model = [name for name in MODEL_LIST if name in model_id.lower()]
+    if len(model) == 0:
+        model = ["gpt-j"]
 
-    if args.ipex_optimize:
-        from optimum.intel import inference_mode as ipex_inference_mode
+    prompt = prompt[model[0]][str(args.input_tokens)]
+    input_seq = get_batched_prompts(prompt, args.batch_size)
 
-        logging.info("Use ipex optimization")
-        with ipex_inference_mode(
-            generator, dtype=torch_dtype, verbose=False, jit=args.jit
-        ) as ipex_pipe:
-            benchmark(
-                ipex_pipe,
-                warm_up_steps,
-                run_steps,
-                input_seq,
-                output_tokens=args.output_tokens,
-                batch_size=args.batch_size,
-            )
+    if args.optimum_intel:
+        from optimum.intel import IPEXModelForCausalLM
+        generator.model = IPEXModelForCausalLM(generator.model, export=True, torch_dtype=torch_dtype)
     elif args.ipex_optimize_transformers:
         import intel_extension_for_pytorch as ipex
-
         generator.model = ipex.optimize_transformers(
             generator.model, dtype=torch_dtype, device=device
         )
-        benchmark(
-            generator,
-            warm_up_steps,
-            run_steps,
-            input_seq,
-            output_tokens=args.output_tokens,
-            batch_size=args.batch_size,
-        )
-    elif args.torch_compile:
+    if args.torch_compile:
         logging.info(f"Use torch compile with {args.backend} backend")
         if args.backend == "ipex":
             import intel_extension_for_pytorch as ipex
-        generator.model.generate = torch.compile(
-            generator.model.generate, backend=args.backend
+        from torch._inductor import config
+        torch._inductor.config.cpp_wrapper = True
+        # pipeline warmup
+        _, _, _ = generate(generator, input_seq, args.batch_size, 1, 1)
+        generator.model.forward = torch.compile(
+            generator.model.forward, backend=args.backend
         )
-        benchmark(
-            generator,
-            warm_up_steps,
-            run_steps,
-            input_seq,
-            output_tokens=args.output_tokens,
-            batch_size=args.batch_size,
-        )
-    else:
-        benchmark(
+        # compile warmup
+        _, _, _ = generate(generator, input_seq, args.batch_size, 1, 1)
+
+    benchmark(
             generator,
             warm_up_steps,
             run_steps,
