@@ -1,25 +1,36 @@
+import os
+import sys
+import torch
+import time
+import PIL
+import logging
+import requests
+logging.basicConfig(level=logging.INFO)
+
+from transformers import set_seed
+from transformers.utils import ContextManagers
 from diffusers import (
     StableDiffusionPipeline,
     DiffusionPipeline,
     DPMSolverMultistepScheduler,
+    StableDiffusionInpaintPipeline,
 )
-import torch
-import time
-import sys
-import logging
-import os
-from transformers.utils import ContextManagers
-
-logging.basicConfig(level=logging.INFO)
-sys.setrecursionlimit(100000)
 
 sys.path.append(os.path.dirname(__file__) + "/..")
+from common import (
+    SEED,
+    get_args,
+    get_torch_dtype,
+    synchronize_device,
+    compute_ssim,
+    log_latency,
+)
 
-from common import get_args, get_torch_dtype, synchronize_device
-
-SEED = 20
+inference_context = [torch.no_grad()]
 PROMPT = "An astronaut riding a green horse"
-
+PROMPT_WITH_MASK_IMAGE = "Face of a yellow cat, high resolution, sitting on a park bench"
+DOG_BENCH = "https://raw.githubusercontent.com/CompVis/latent-diffusion/main/data/inpainting_examples/overture-creations-5sI6fQgYIuo.png"
+DOG_BENCH_MASK = "https://raw.githubusercontent.com/CompVis/latent-diffusion/main/data/inpainting_examples/overture-creations-5sI6fQgYIuo_mask.png"
 MODEL_INPUT_SIZE = {
     "stabilityai/stable-diffusion-xl-base-1.0": {
         "sample": (2, 4, 128, 128),
@@ -40,16 +51,14 @@ MODEL_INPUT_SIZE = {
     },
 }
 
-inference_context = [torch.no_grad()]
 
-
-def load_model(model_id, seed, model_dtype, device):
-    torch.manual_seed(seed)
+def load_model(model_id, model_dtype, device):
+    set_seed(SEED)
     if model_id == "stabilityai/stable-diffusion-xl-base-1.0":
         pipe = DiffusionPipeline.from_pretrained(
             model_id, torch_dtype=model_dtype, use_safetensors=True
         )
-    elif model_id == "runwayml/stable-diffusion-v1-5":
+    elif model_id in ["runwayml/stable-diffusion-v1-5", "stable-diffusion-v1-5/stable-diffusion-v1-5"]:
         pipe = StableDiffusionPipeline.from_pretrained(
             model_id, torch_dtype=model_dtype
         )
@@ -58,25 +67,41 @@ def load_model(model_id, seed, model_dtype, device):
             model_id, torch_dtype=model_dtype
         )
         pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+    elif model_id == "stable-diffusion-v1-5/stable-diffusion-inpainting":
+        pipe = StableDiffusionInpaintPipeline.from_pretrained(
+            model_id, torch_dtype=model_dtype
+        )
     else:
         raise ValueError("the given model id is not supported currently.")
     pipe.to(device)
     return pipe
 
 
-def benchmark(pipe, prompt, seed, nb_pass):
+def benchmark(pipe, model_id, nb_pass, prompt, **kwargs):
+    image = kwargs.get("image", None)
+    mask_image = kwargs.get("mask_image", None)
     elapsed_time = []
     for i in range(nb_pass):
         synchronize_device(pipe.device.type)
         start = time.time()
-        torch.manual_seed(seed)
-        image = pipe(prompt=prompt).images[0]
+        set_seed(SEED)
+        if model_id == "stable-diffusion-v1-5/stable-diffusion-inpainting":
+            image = pipe(prompt=prompt, image=image, mask_image=mask_image).images[0]
+        else:
+            image = pipe(prompt=prompt).images[0]
         synchronize_device(pipe.device.type)
         duration = time.time() - start
         elapsed_time.append(duration * 1000)
-        image.save(f"img_{i}.jpg", "JPEG")
 
-    return elapsed_time
+    return elapsed_time, image
+
+
+def prepare_image():
+    image = PIL.Image.open(requests.get(DOG_BENCH, stream=True).raw)
+    image = PIL.ImageOps.exif_transpose(image).convert("RGB")
+    mask_image = PIL.Image.open(requests.get(DOG_BENCH_MASK, stream=True).raw)
+    mask_image = PIL.ImageOps.exif_transpose(mask_image).convert("RGB")
+    return image, mask_image
 
 
 def prepare_inputs(model_id, jit, dtype, device):
@@ -184,16 +209,25 @@ if __name__ == "__main__":
     use_torch_compile = args.torch_compile
     backend = args.backend
     device = args.device
-    if device == "xpu":
-        import intel_extension_for_pytorch as ipex
+    compare_outputs = args.compare_outputs
 
     torch_dtype = get_torch_dtype(args.model_dtype)
     dtype = get_torch_dtype(args.autocast_dtype)
-    enable = dtype != torch.float32
-    if enable:
-        inference_context.append(torch.autocast(device, dtype, enable))
+    apply_cast = dtype != torch.float32
+    if apply_cast:
+        inference_context.append(torch.autocast(device, dtype, apply_cast))
 
-    pipe = load_model(model_id, SEED, model_dtype=torch_dtype, device=device)
+    pipe = load_model(model_id, model_dtype=torch_dtype, device=device)
+
+    image = None
+    mask_image = None
+    prompt = PROMPT
+    if model_id == "stable-diffusion-v1-5/stable-diffusion-inpainting":
+        image, mask_image = prepare_image()
+        prompt = PROMPT_WITH_MASK_IMAGE
+
+    if compare_outputs:
+        _, eager_image = benchmark(pipe, model_id, 1, prompt, image=image, mask_image=mask_image)
 
     if use_ipex_optimize:
         pipe = optimize_with_ipex(
@@ -206,10 +240,18 @@ if __name__ == "__main__":
     if use_torch_compile:
         pipe = apply_torch_compile(pipe, backend)
 
-    with ContextManagers(inference_context):
-        elapsed_time = benchmark(pipe, PROMPT, SEED, warm_up_steps + run_steps)
+    if compare_outputs:
+        _, optimized_image = benchmark(pipe, model_id, 1, prompt, image=image, mask_image=mask_image)
 
-    logging.info(f"total time [s]: {elapsed_time}")
-    logging.info(
-        f"pipeline average time [ms]: {sum(elapsed_time[warm_up_steps:])/run_steps}"
-    )
+        ssim_score = compute_ssim(eager_image, optimized_image)
+        logging.info(f"similarity (SSIM): {ssim_score}")
+        threshold = 0.9 if model_id == "stabilityai/stable-diffusion-xl-base-1.0" else 0.98
+        assert ssim_score > threshold
+
+    with ContextManagers(inference_context):
+        elapsed_time, image = benchmark(pipe, model_id, warm_up_steps + run_steps, prompt, image=image, mask_image=mask_image)
+
+
+    log_latency(elapsed_time, warm_up_steps, run_steps)
+    image_path = "image_" + model_id.replace("/", "_") + ".jpg"
+    image.save(image_path, "JPEG")

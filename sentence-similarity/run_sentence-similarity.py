@@ -1,28 +1,32 @@
+import os
 import torch
 import time
 import sys
-import logging
-from transformers import pipeline
 import torch.nn.functional as F
+import logging
+logging.basicConfig(level=logging.INFO)
+
+from transformers import pipeline, set_seed
 from transformers.utils import ContextManagers
 
-import os
-
 sys.path.append(os.path.dirname(__file__) + "/..")
+from common import (
+    SEED,
+    get_args,
+    get_torch_dtype,
+    wrap_forward_for_benchmark,
+    synchronize_device,
+    log_latency,
+)
 
-from common import get_args, get_torch_dtype, wrap_forward_for_benchmark, synchronize_device
-
-logging.basicConfig(level=logging.INFO)
-SEED = 20
+inference_context = [torch.inference_mode()]
 SENTENCES = ["This is an example sentence", "Each sentence is converted"]
 CHI_SENTENCES = ["如何更换花呗绑定银行卡", "花呗更改绑定银行卡"]
-
 MODEL_INPUT_SIZE = {
     "input_ids": (1, 7),
     "token_type_ids": (1, 7),
     "attention_mask": (1, 7),
 }
-inference_context = [torch.inference_mode()]
 
 
 # Mean Pooling - Take attention mask into account for correct averaging
@@ -35,11 +39,11 @@ def mean_pooling(token_embeddings, attention_mask):
     )
 
 
-def benchmark(extractor, sentences, seed, nb_pass):
+def benchmark(extractor, sentences, nb_pass):
     elapsed_times = []
     forward_times = []
     for _ in range(nb_pass):
-        torch.manual_seed(seed)
+        set_seed(SEED)
         extractor.forward_time = 0
         synchronize_device(extractor.device.type)
         start = time.time()
@@ -58,8 +62,8 @@ def benchmark(extractor, sentences, seed, nb_pass):
         duration = time.time() - start
         elapsed_times.append(duration * 1000)
         forward_times.append(extractor.forward_time * 1000)
-        logging.info(score)
-    return elapsed_times, forward_times
+
+    return elapsed_times, forward_times, score
 
 
 def prepare_jit_inputs(model_id, device):
@@ -127,17 +131,14 @@ if __name__ == "__main__":
     use_jit = args.jit
     use_torch_compile = args.torch_compile
     backend = args.backend
-
     device = args.device
-    if device == "xpu":
-        import intel_extension_for_pytorch as ipex
-        torch.use_deterministic_algorithms(True)
-        
+    compare_outputs = args.compare_outputs
+
     torch_dtype = get_torch_dtype(args.model_dtype)
     dtype = get_torch_dtype(args.autocast_dtype)
-    enable = dtype != torch.float32
-    if enable:
-        inference_context.append(torch.autocast(device, dtype, enable))
+    apply_cast = dtype != torch.float32
+    if apply_cast:
+        inference_context.append(torch.autocast(device, dtype, apply_cast))
 
     if "shibing624/text2vec-base-chinese" in model_id:
         sentences = CHI_SENTENCES
@@ -153,6 +154,9 @@ if __name__ == "__main__":
     )
     wrap_forward_for_benchmark(extractor)
 
+    if compare_outputs:
+        _, _, eager_outputs = benchmark(extractor, sentences, 1)
+
     if use_ipex_optimize:
         extractor = optimize_with_ipex(extractor, dtype=torch_dtype)
     if use_jit:
@@ -162,14 +166,17 @@ if __name__ == "__main__":
     if use_torch_compile:
         extractor = apply_torch_compile(extractor, backend)
 
+    if compare_outputs:
+        _, _, optimized_outputs = benchmark(extractor, sentences, 1)
+
+        mae = abs(eager_outputs.item() - optimized_outputs.item())
+        logging.info(f"similarity (1 - MAE): {1 - mae}")
+        assert mae < 5e-3
+
     with ContextManagers(inference_context):
-        elapsed_times, forward_times = benchmark(
-            extractor, sentences, SEED, warm_up_steps + run_steps
+        elapsed_times, forward_times, output = benchmark(
+            extractor, sentences, warm_up_steps + run_steps
         )
 
-    average_time = sum(elapsed_times[warm_up_steps:]) / run_steps
-    average_fwd_time = sum(forward_times[warm_up_steps:]) / run_steps
-    logging.info(f"total time [ms]: {elapsed_times}")
-    logging.info(
-        f"pipeline average time [ms] {average_time}, average fwd time [ms] {average_fwd_time}"
-    )
+    log_latency(elapsed_times, warm_up_steps, run_steps, forward_times)
+    logging.info(f"output = {output}")

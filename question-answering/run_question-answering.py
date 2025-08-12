@@ -1,19 +1,23 @@
-from PIL import Image
-from transformers import pipeline
+import os
+import sys
 import torch
 import time
 import logging
-import sys
+logging.basicConfig(level=logging.INFO)
+
+from transformers import pipeline
 from transformers.utils import ContextManagers
 
-sys.setrecursionlimit(10000000)
-
-import os
-
 sys.path.append(os.path.dirname(__file__) + "/..")
-from common import get_args, get_torch_dtype, wrap_forward_for_benchmark, synchronize_device
+from common import (
+    get_args,
+    get_torch_dtype,
+    wrap_forward_for_benchmark,
+    synchronize_device,
+    compute_dict_outputs_mae,
+    log_latency,
+)
 
-logging.basicConfig(level=logging.INFO)
 inference_context = [torch.inference_mode()]
 
 
@@ -28,7 +32,7 @@ def prepare_jit_inputs(device):
 
 
 def benchmark(pipe, question, context, warm_up_steps, run_steps):
-    time_costs = []
+    pipeline_times = []
     forward_times = []
     with ContextManagers(inference_context):
         for i in range(warm_up_steps + run_steps):
@@ -37,16 +41,10 @@ def benchmark(pipe, question, context, warm_up_steps, run_steps):
             pre = time.time()
             output = pipe(question=question, context=context)
             synchronize_device(pipe.device.type)
-            time_costs.append((time.time() - pre) * 1000)
+            pipeline_times.append((time.time() - pre) * 1000)
             forward_times.append(pipe.forward_time * 1000)
 
-    average_time = sum(time_costs[warm_up_steps:]) / run_steps
-    average_fwd_time = sum(forward_times[warm_up_steps:]) / run_steps
-    logging.info(f"total time [ms]: {time_costs}")
-    logging.info(
-        f"pipeline average time [ms] {average_time}, average fwd time [ms] {average_fwd_time}"
-    )
-    logging.info(f"output = {output}")
+    return output, pipeline_times, forward_times
 
 
 if __name__ == "__main__":
@@ -55,19 +53,17 @@ if __name__ == "__main__":
     warm_up_steps = args.warm_up_steps
     run_steps = args.run_steps
     model_id = args.model_id
-
     device = args.device
-    if device == "xpu":
-        import intel_extension_for_pytorch as ipex
+    compare_outputs = args.compare_outputs
 
     question = "Where do I live?"
     context = "My name is Merve and I live in İstanbul."
 
     torch_dtype = get_torch_dtype(args.model_dtype)
     dtype = get_torch_dtype(args.autocast_dtype)
-    enable = dtype != torch.float32
-    if enable:
-        inference_context.append(torch.autocast(device, dtype, enable))
+    apply_cast = dtype != torch.float32
+    if apply_cast:
+        inference_context.append(torch.autocast(device, dtype, apply_cast))
 
     pipe = pipeline(
         "question-answering",
@@ -76,6 +72,9 @@ if __name__ == "__main__":
         device=device,
     )
     wrap_forward_for_benchmark(pipe)
+
+    if compare_outputs:
+        eager_outputs, _, _ = benchmark(pipe, question, context, 0, 1)
 
     if args.optimum_intel:
         logging.info("Use optimum-intel")
@@ -104,4 +103,18 @@ if __name__ == "__main__":
         pipe.model(**example_inputs)
         pipe.model(**example_inputs)
 
-    benchmark(pipe, question, context, warm_up_steps, run_steps)
+    if compare_outputs:
+        optimized_outputs, _, _ = benchmark(pipe, question, context, 0, 1)
+
+        if isinstance(eager_outputs, dict):
+            eager_outputs, optimized_outputs = [eager_outputs], [optimized_outputs]
+        mae = compute_dict_outputs_mae(eager_outputs, optimized_outputs)
+        logging.info(f"similarity (1 - MAE): {1 - mae}")
+        assert mae < 5e-3
+
+    output, pipeline_times, forward_times = benchmark(
+        pipe, question, context, warm_up_steps, run_steps
+    )
+
+    log_latency(pipeline_times, warm_up_steps, run_steps, forward_times)
+    logging.info(f"output = {output}")

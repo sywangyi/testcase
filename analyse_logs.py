@@ -4,9 +4,13 @@ import fire
 def main(file_names, out_name):
     info_list = [
         "INFO:root:args",
+        "INFO:root:total",
         "INFO:root:pipeline",
+        "INFO:root:average_fwd_time",
+        "INFO:root:model",
         "INFO:root:1st",
         "INFO:root:2nd+",
+        "INFO:root:similarity",
     ]
     write_list = []
     file_names = file_names.split(",")

@@ -1,17 +1,15 @@
+import os
+import sys
 import time
 import torch
 import json
-from transformers import pipeline, AutoTokenizer
 import logging
-from transformers.utils import ContextManagers
-
 logging.basicConfig(level=logging.INFO)
 
-import sys
-import os
+from transformers import pipeline, AutoTokenizer
+from transformers.utils import ContextManagers
 
 sys.path.append(os.path.dirname(__file__) + "/..")
-
 from common import (
     get_args,
     get_torch_dtype,
@@ -20,21 +18,12 @@ from common import (
     wrap_forward_for_benchmark,
     synchronize_device,
     get_batched_prompts,
+    compute_sentence_similarity,
 )
 
 inference_context = [torch.no_grad()]
+MODEL_LIST = ["gpt-j", "llama", "gpt-neox", "opt", "falcon", "bloom", "t5", "gpt2"]
 
-MODEL_LIST = [
-    "gpt-j",
-    "llama",
-    "gpt-neox",
-    "opt",
-    "falcon",
-    "bloom",
-    "baichuan",
-    "t5",
-    "gpt2",
-]
 
 def generate(generator, input_sentence, batch_size, warm_up_steps, run_steps):
     latency = []
@@ -96,38 +85,40 @@ if __name__ == "__main__":
     warm_up_steps = args.warm_up_steps
     run_steps = args.run_steps
     model_id = args.model_id
-
-    logging.info(f"args = {args}")
-
     device = args.device
-    if device == "xpu":
-        import intel_extension_for_pytorch as ipex
+    compare_outputs = args.compare_outputs
+    logging.info(f"args = {args}")
 
     with open("./datasets/prompt.json", "r") as f:
         prompt = json.load(f)
 
     torch_dtype = get_torch_dtype(args.model_dtype)
     dtype = get_torch_dtype(args.autocast_dtype)
-    enable = dtype != torch.float32
-    if enable:
-        inference_context.append(torch.autocast(device, dtype, enable))
+    apply_cast = dtype != torch.float32
+    if apply_cast:
+        inference_context.append(torch.autocast(device, dtype, apply_cast))
     
     device_map = {"": 0} if device != "cpu" else "cpu"
     model_kwargs = dict(torch_dtype=torch_dtype, device_map=device_map)
+
     quantization_config = None
-    if args.bitsandbytes in ("int8", "nf4", "fp4"):
-        logging.info(f"Use {args.bitsandbytes} bitsandbytes quantization")
-        quantization_config = get_bitsandbytes_config(args.bitsandbytes)
-    elif args.autoawq in ("int4"):
-        logging.info(f"Use {args.autoawq} AutoAWQ quantization, please use it in a AWQ int4 model like TheBloke/Mistral-7B-v0.1-AWQ")
-        quantization_config = get_awq_config(args.autoawq)
+    if args.quant_algo == "bitsandbytes":
+        logging.info(f"Use {args.quant_dtype} bitsandbytes quantization")
+        quantization_config = get_bitsandbytes_config(args.quant_dtype)
+    elif args.quant_algo == "autoawq":
+        logging.info(f"Use {args.quant_dtype} AutoAWQ quantization, please pass a quantized model like 'TheBloke/firefly-llama2-7B-chat-AWQ'")
+        quantization_config = get_awq_config(args.quant_dtype)
+    elif args.quant_algo == "gptqmodel":
+        logging.info(f"Use {args.quant_dtype} GPTQModel quantization, please pass a quantized model like 'TheBloke/TinyLlama-1.1B-Chat-v0.3-GPTQ'")
+        quantization_config = None
 
     if quantization_config is not None:
         model_kwargs["quantization_config"] = quantization_config
 
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     tokenizer.padding_side = 'left'
-    tokenizer.pad_token_id = tokenizer.eos_token_id
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
     generator = pipeline(
         "text-generation",
         model=model_id,
@@ -135,7 +126,7 @@ if __name__ == "__main__":
         model_kwargs=model_kwargs,
     )
     generation_config = generator.model.generation_config
-    generation_config.do_sample = False
+    generation_config.do_sample = args.do_sample
     generation_config.use_cache = True
     generation_config.temperature = 1.0
     generation_config.num_beams = args.num_beams
@@ -157,9 +148,12 @@ if __name__ == "__main__":
     prompt = prompt[model[0]][str(args.input_tokens)]
     input_seq = get_batched_prompts(prompt, args.batch_size)
 
+    if compare_outputs:
+        _, eager_outputs, _ = generate(generator, input_seq, args.batch_size, 0, 1)
+
     if args.optimum_intel:
         from optimum.intel import IPEXModelForCausalLM
-        generator.model = IPEXModelForCausalLM(generator.model, export=True, torch_dtype=torch_dtype)
+        generator.model = IPEXModelForCausalLM(generator.model, torch_dtype=torch_dtype)
     elif args.ipex_optimize_transformers:
         import intel_extension_for_pytorch as ipex
         generator.model = ipex.optimize_transformers(
@@ -169,8 +163,6 @@ if __name__ == "__main__":
         logging.info(f"Use torch compile with {args.backend} backend")
         if args.backend == "ipex":
             import intel_extension_for_pytorch as ipex
-        from torch._inductor import config
-        torch._inductor.config.cpp_wrapper = True
         # pipeline warmup
         _, _, _ = generate(generator, input_seq, args.batch_size, 1, 1)
         generator.model.forward = torch.compile(
@@ -178,6 +170,21 @@ if __name__ == "__main__":
         )
         # compile warmup
         _, _, _ = generate(generator, input_seq, args.batch_size, 1, 1)
+
+    if compare_outputs:
+        _, optimized_outputs, _ = generate(generator, input_seq, args.batch_size, 0, 1)
+
+        similarity_scores = []
+        for i in range(len(eager_outputs)):
+            for j in range(len(eager_outputs[0])):
+                similarity_scores.append(compute_sentence_similarity(eager_outputs[i][j]["generated_text"], optimized_outputs[i][j]["generated_text"]))
+
+        avg_score = sum(similarity_scores) / len(similarity_scores)
+        logging.info(f"similarity (average sentence similarity): {avg_score}")
+
+        if args.input_tokens == 32 and args.output_tokens == 32 and args.batch_size == 1 and args.num_beams == 1:
+            threshold = 0.99 if torch.compile else 0.8
+            assert avg_score > threshold
 
     benchmark(
             generator,

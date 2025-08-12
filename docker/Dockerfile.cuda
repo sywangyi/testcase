@@ -1,0 +1,70 @@
+# modified from https://github.com/huggingface/transformers/blob/main/docker/transformers-pytorch-deepspeed-latest-gpu/Dockerfile
+FROM nvidia/cuda:12.8.1-devel-ubuntu22.04 AS base
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+ARG CUDA_VER=cu128
+ARG PYTHON_VER=3.11
+ARG PYTORCH_VER=2.7.0
+
+RUN apt-get update && \
+    apt-get -y install \
+    python$PYTHON_VER \
+    python$PYTHON_VER-dev \
+    python3-pip \
+    python-is-python3 \
+    git \
+    git-lfs \
+    cmake \
+    ffmpeg \
+    numactl \
+    vim \
+    tesseract-ocr \
+    espeak-ng \
+    wget \
+    software-properties-common \
+    libsndfile1-dev \
+    ca-certificates \
+    libmpich-dev \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --upgrade pip
+RUN pip install vllm
+RUN pip install --no-cache-dir -U torch==$PYTORCH_VER torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/$CUDA_VER
+
+RUN pip install torchdata pyctcdecode pytesseract decord galore-torch fire scipy scikit-learn sentencepiece sacremoses nltk rouge_score librosa soundfile g2p_en mpi4py
+RUN pip install pretty_midi essentia resampy Levenshtein av sacrebleu phonemizer tensorboard invisible_watermark schedulefree clearml
+RUN pip install gguf hqq compressed_tensors liger-kernel gptqmodel mergekit torchao transformer-engine onnx autoawq[kernels] auto_round apollo-torch eetq
+RUN pip install hf_transfer huggingface-hub hf-doc-builder datasets optimum-quanto timm transformers accelerate optimum peft
+
+RUN pip install --no-cache-dir bitsandbytes
+RUN pip install onnxruntime-gpu --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/
+RUN pip install git+https://github.com/facebookresearch/detectron2.git
+
+RUN touch /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+RUN echo "#!/bin/bash" >> /entrypoint.sh
+RUN echo "/bin/bash" >> /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
+
+FROM base AS ut
+
+RUN pip install pytest-env pytest-timeout pytest-rerunfailures openpyxl
+RUN pip install git+https://github.com/ssrikanta/pytest-excel.git
+WORKDIR /.tests
+ARG QUANTO_COMMIT=157f419c2c5c72fe5dadd302255380c0644e5e78
+ARG TRANSFORMERS_COMMIT=6e3063422c4b1c014aa60c32b9254fd2902f0f28
+ARG ACCELERATE_COMMIT=16bf1d89016e03f5b0d8545e9883df7fe9ab9b5f
+ARG PEFT_COMMIT=62c9cf30319ca219e1d6754626c17f510fc76441
+ARG DIFFUSERS_COMMIT=f161e277d0ec534afa4dfc461bc5baacffd7278b
+ARG TRL_COMMIT=3ef9faf2574e9ead0edad668de8d41d228a088c9
+RUN pip install git+https://github.com/muellerzr/import-timer.git
+RUN pip install --ignore-installed --force-reinstall blinker
+RUN git clone https://github.com/huggingface/optimum-quanto.git && cd optimum-quanto && git checkout $QUANTO_COMMIT && pip install .[dev]
+RUN git clone https://github.com/huggingface/transformers && cd transformers && git checkout $TRANSFORMERS_COMMIT && pip install .[deepspeed-testing]
+RUN git clone https://github.com/huggingface/accelerate.git && cd accelerate && git checkout $ACCELERATE_COMMIT && pip install .[testing,test_trackers]
+RUN git clone https://github.com/huggingface/peft.git && cd peft && git checkout $PEFT_COMMIT && pip install .[test]
+RUN git clone https://github.com/huggingface/diffusers.git && cd diffusers && git checkout $DIFFUSERS_COMMIT && pip install .[test]
+RUN git clone https://github.com/huggingface/trl.git && cd trl && git checkout $TRL_COMMIT && pip install .[test]
