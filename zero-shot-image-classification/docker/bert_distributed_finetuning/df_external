@@ -1,0 +1,67 @@
+FROM python:3.9
+LABEL maintainer="Hugging Face"
+
+ARG DIR=/usr/local
+ARG http_proxy=http://proxy-chain.intel.com:911
+ARG https_proxy=https://proxy-chain.intel.com:911
+ARG no_proxy=*.intel.com
+ 
+WORKDIR $DIR
+
+# Create virtual environment
+RUN python -m venv env 
+
+ENV PATH=$DIR/env/bin:$PATH
+
+ENV http_proxy=$http_proxy
+ENV https_proxy=$https_proxy 
+ENV no_proxy=$no_proxy
+
+RUN python3 -m pip install --upgrade pip
+
+RUN pip3 install torch==1.12.0+cpu torchvision==0.13.0+cpu torchaudio==0.12.0 --extra-index-url https://download.pytorch.org/whl/cpu
+
+# Install intel extension for pytorch
+RUN python3 -m pip install intel_extension_for_pytorch==1.12.0
+
+# Install torch-ccl
+RUN python3 -m pip install oneccl_bind_pt==1.12.0 -f https://software.intel.com/ipex-whl-stable
+
+# Install evaluate needed by example
+RUN python3 -m pip install evaluate
+
+# Install mpi
+COPY l_mpi_oneapi_p_2021.6.0.602.sh .
+RUN ./l_mpi_oneapi_p_2021.6.0.602.sh -a --eula accept -s
+
+# Install transformer
+RUN git clone https://github.com/huggingface/transformers && cd transformers && python3 -m pip install --no-cache-dir .
+
+# Install accelerate
+RUN git clone https://github.com/huggingface/accelerate && cd accelerate && python3 -m pip install --no-cache-dir .
+
+# Prepare transformers QA dataset
+RUN python3 -m pip install -r ./transformers/examples/pytorch/question-answering/requirements.txt
+
+RUN apt-get update
+
+# ssh config
+RUN sed -i '1i export LD_LIBRARY_PATH=/lib64/:$LD_LIBRARY_PATH' /root/.bashrc && /bin/bash -c "source /root/.bashrc" && \
+apt-get install -y openssh-client openssh-server net-tools libnfs-utils && \
+ssh-keygen -t rsa -f ~/.ssh/id_rsa -P '' && cat /root/.ssh/id_rsa.pub >> /root/.ssh/authorized_keys && \
+chmod 600 /root/.ssh/authorized_keys && sed -i 's/PermitEmptyPasswords yes/PermitEmptyPasswords no /' /etc/ssh/sshd_config && \
+sed -i 's/PermitRootLogin without-password/PermitRootLogin yes /' /etc/ssh/sshd_config && \
+echo " StrictHostKeyChecking no" >> /etc/ssh/ssh_config && \
+echo " UserKnownHostsFile /dev/null" >> /etc/ssh/ssh_config
+RUN ssh-keygen -t dsa -f ~/.ssh/id_dsa -P ''  && ssh-keygen -t ecdsa -f ~/.ssh/id_ecdsa -P '' && ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -P ''
+RUN sed -i "s/etc\/ssh\/ssh_host_rsa_key/root\/.ssh\/id_rsa/g" /etc/ssh/sshd_config
+RUN sed -i "s/etc\/ssh\/ssh_host_ecdsa_key/root\/.ssh\/id_ecdsa/g" /etc/ssh/sshd_config && \
+sed -i "s/etc\/ssh\/ssh_host_ed25519_key/root\/.ssh\/id_ed25519/g" /etc/ssh/sshd_config && \
+sed -i "/root\/.ssh\/id_rsa/a HostKey /root/.ssh/id_dsa" /etc/ssh/sshd_config && \
+sed -i "s/#AuthorizedKeysFile/AuthorizedKeysFile/g" /etc/ssh/sshd_config && \
+sed -i "s/#HostKey/HostKey/g" /etc/ssh/sshd_config
+
+COPY run_qa_entrypoint.sh .
+RUN chmod +x ./run_qa_entrypoint.sh
+ENTRYPOINT ["bash", "./run_qa_entrypoint.sh"]
+

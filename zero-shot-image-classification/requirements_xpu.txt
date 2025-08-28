@@ -1,0 +1,15 @@
+diffusers
+librosa
+soundfile
+pyctcdecode
+sentencepiece
+tokenizers
+peft
+huggingface-hub
+datasets
+evaluate
+diffusers 
+requests
+transformers
+accelerate
+datasets

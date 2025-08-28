@@ -1,0 +1,42 @@
+{
+    "model_name_or_path": "meta-llama/Llama-2-70b-hf",
+    "dataset_name": "tatsu-lab/alpaca",
+    "bf16": true,
+    "output_dir": "./lora_out",
+    "max_seq_length": 2048,
+    "gradient_checkpointing": true,
+    "per_device_train_batch_size": 5,
+    "per_device_eval_batch_size": 1,
+    "gradient_accumulation_steps": 2,
+    "num_train_epochs": 2,
+    "learning_rate": 0.0004,
+    "warmup_ratio": 0.03,
+    "lr_scheduler_type": "constant",
+    "logging_steps": 1,
+    "save_strategy": "no",
+    "dataset_concatenation": true,
+    "do_train": true,
+    "do_eval": true,
+    "eval_strategy": "epoch",
+    "eval_delay": 2,
+    "torch_compile": true,
+    "validation_split_percentage": 4,
+    
+    "lora_rank": 4,
+    "lora_target_modules": ["q_proj", "v_proj", "k_proj", "o_proj"],
+    
+    "fsdp": "auto_wrap",
+    "fsdp_config": {
+        "fsdp_auto_wrap_policy": "TRANSFORMER_BASED_WRAP",
+        "fsdp_backward_prefetch": "BACKWARD_PRE",
+        "fsdp_forward_prefetch": false,
+        "fsdp_offload_params": false,
+        "fsdp_sharding_strategy": 1,
+        "fsdp_state_dict_type": "FULL_STATE_DICT",
+        "fsdp_sync_module_states": true,
+        "fsdp_use_orig_params": true,
+        "transformer_layer_cls_to_wrap": "LlamaDecoderLayer",
+        "fsdp_activation_checkpointing": false,
+        "fsdp_cpu_ram_efficient_loading": true
+    }
+}
