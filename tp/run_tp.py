@@ -5,8 +5,9 @@ import torch
 import json
 import logging
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from transformers.utils import ContextManagers
+from transformers.distributed import DistributedConfig
 
 sys.path.append(os.path.dirname(__file__) + "/..")
 from common import (
@@ -73,7 +74,10 @@ if __name__ == "__main__":
     tp_plan = args.tp_plan
     device = args.device
     if device == "cpu":
-        import oneccl_bindings_for_pytorch
+        try:
+            import oneccl_bindings_for_pytorch
+        except ImportError:
+            print("oneccl_bindings_for_pytorch is not installed. Use gloo backend.")
         os.environ['RANK'] = str(os.environ.get('PMI_RANK', 0))
         os.environ['LOCAL_RANK'] = str(os.environ.get('PMI_RANK', 0))
         os.environ['WORLD_SIZE'] = str(os.environ.get('PMI_SIZE', 1))
@@ -91,12 +95,26 @@ if __name__ == "__main__":
     torch_dtype = get_torch_dtype(args.model_dtype)
     dtype = get_torch_dtype(args.autocast_dtype)
     model_kwargs = dict(torch_dtype=torch_dtype, tp_plan=tp_plan)
+    if args.enable_ep:
+        model_kwargs["distributed_config"] = DistributedConfig(enable_expert_parallel=1)
+
+    config = AutoConfig.from_pretrained(model_id)
+    if config.model_type == "gpt_oss" and args.enable_ep:
+        # mannually set ep_plan for gpt-oss
+        config.base_model_ep_plan = {
+            "layers.*.mlp.experts": "gather",
+            "layers.*.mlp.router": "ep_router",
+            "layers.*.mlp.experts.gate_up_proj": "grouped_gemm",
+            "layers.*.mlp.experts.gate_up_proj_bias": "grouped_gemm",
+            "layers.*.mlp.experts.down_proj": "grouped_gemm",
+            "layers.*.mlp.experts.down_proj_bias": "grouped_gemm",
+        }
 
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     tokenizer.padding_side = 'left'
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
-    model = AutoModelForCausalLM.from_pretrained(model_id, **model_kwargs)
+    model = AutoModelForCausalLM.from_pretrained(model_id, config=config, **model_kwargs)
     generation_config = model.generation_config
     generation_config.do_sample = args.do_sample
     generation_config.use_cache = True

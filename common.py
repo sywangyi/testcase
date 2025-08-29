@@ -67,6 +67,7 @@ def get_args():
     parser.add_argument(
         "--tp_plan", default="auto", type=str, help="tensor parallelism strategy"
     )
+    parser.add_argument("--enable_ep", default="False", type=str2bool)
     parser.add_argument("--local_rank", default=0, type=int)
 
     args = parser.parse_args()

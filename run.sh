@@ -36,6 +36,7 @@ optimum_habana=False  # Add default value for optimum_habana
 # TP args
 tp_plan="auto"
 tp_size=1
+enable_ep=False
 
 # Compare outputs
 compare_outputs=False
@@ -70,6 +71,7 @@ usage() {
  echo " --parallel_type       Choose parallel type for accelerate[ddp, fsdp]"
  echo " --tp_plan             Run model with tensor parallelism"
  echo " --tp_size             The tensor parallelism size"
+ echo " --enable_ep           If enable expert parallelism"
  echo " --compare_outputs     Compare outputs of baseline model and optimized model"
  echo " --optimum_habana      Enable or disable optimum Habana [True, False]"  # Add usage for optimum_habana
  echo " --output_dir          Specify the output directory for results"
@@ -205,6 +207,10 @@ handle_options() {
         tp_size=$(extract_argument $@)
         shift
         ;;
+      --enable_ep)
+        enable_ep=$(extract_argument $@)
+        shift
+        ;;
       --compare_outputs)
         compare_outputs=$(extract_argument $@)
         shift
@@ -239,10 +245,18 @@ export TORCHINDUCTOR_FREEZING=1
 export TORCHINDUCTOR_CPP_WRAPPER=1
 export TRITON_CODEGEN_INTEL_XPU_BACKEND=1
 
-small_model_list=("Helsinki-NLP/opus-mt-mul-en" "google-t5/t5-small" "facebook/dinov2-small" "sentence-transformers/all-mpnet-base-v2" "sentence-transformers/all-MiniLM-L6-v2" "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
-for item in "${small_model_list[@]}"; do
+small_model_list_4_cores=("Helsinki-NLP/opus-mt-mul-en" "google-t5/t5-small" "facebook/dinov2-small" "sentence-transformers/all-mpnet-base-v2" "sentence-transformers/all-MiniLM-L6-v2" "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+for item in "${small_model_list_4_cores[@]}"; do
   if [[ "$item" == "$model_id" ]]; then
     CORES=4
+    break
+  fi
+done
+
+small_model_list_8_cores=("google/vit-base-patch16-224-in21k")
+for item in "${small_model_list_8_cores[@]}"; do
+  if [[ "$item" == "$model_id" ]]; then
+    CORES=8
     break
   fi
 done
@@ -400,7 +414,7 @@ elif [[ "$task_name" == "tp" ]]; then
   if [[ "$device" == "hpu" ]]; then
     deepspeed --num_gpus $tp_size $task_name/run_"$task_name"_deepspeed.py --model_id $model_id --model_dtype $model_dtype --ipex_optimize $ipex_optimize --autocast_dtype $autocast_dtype --device $device --batch_size $batch_size --num_beams $num_beams --input_tokens $input_tokens --output_tokens $output_tokens --do_sample $do_sample --ipex_optimize_transformers $ipex_optimize_transformers --warm_up_steps $warm_up_steps --run_steps $run_steps --optimum_intel $optimum_intel --optimum_habana $optimum_habana
   else
-    accelerate launch --config_file "fine-tune/"$device"_tp_config.yaml" $task_name/run_$task_name.py --model_id $model_id --model_dtype $model_dtype --quant_algo $quant_algo --quant_dtype $quant_dtype --jit $jit --ipex_optimize $ipex_optimize --autocast_dtype $autocast_dtype --torch_compile $torch_compile --backend $backend --device $device --batch_size $batch_size --num_beams $num_beams --input_tokens $input_tokens --output_tokens $output_tokens --do_sample $do_sample --ipex_optimize_transformers $ipex_optimize_transformers --warm_up_steps $warm_up_steps --run_steps $run_steps --optimum_intel $optimum_intel --tp_plan $tp_plan --optimum_habana $optimum_habana
+    accelerate launch --config_file "fine-tune/"$device"_tp_config.yaml" $task_name/run_$task_name.py --model_id $model_id --model_dtype $model_dtype --quant_algo $quant_algo --quant_dtype $quant_dtype --jit $jit --ipex_optimize $ipex_optimize --autocast_dtype $autocast_dtype --torch_compile $torch_compile --backend $backend --device $device --batch_size $batch_size --num_beams $num_beams --input_tokens $input_tokens --output_tokens $output_tokens --do_sample $do_sample --ipex_optimize_transformers $ipex_optimize_transformers --warm_up_steps $warm_up_steps --run_steps $run_steps --optimum_intel $optimum_intel --tp_plan $tp_plan --enable_ep $enable_ep --optimum_habana $optimum_habana
   fi
 else
   numactl -C '0-'$[CORES-1] --membind 0 python $task_name/run_$task_name.py --model_id $model_id --model_dtype $model_dtype --quant_algo $quant_algo --quant_dtype $quant_dtype --jit $jit --ipex_optimize $ipex_optimize --autocast_dtype $autocast_dtype --torch_compile $torch_compile --backend $backend --device $device --batch_size $batch_size --num_beams $num_beams --input_tokens $input_tokens --output_tokens $output_tokens --do_sample $do_sample --ipex_optimize_transformers $ipex_optimize_transformers --warm_up_steps $warm_up_steps --run_steps $run_steps --optimum_intel $optimum_intel --compare_outputs $compare_outputs --optimum_habana $optimum_habana
